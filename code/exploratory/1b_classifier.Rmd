@@ -1,0 +1,348 @@
+---
+title: "Correlation Networks"
+author: "Ioannis Siavelis, Georgios Panos"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapse: false
+    theme: "readable"
+---
+<!-- Lab creator: Ioannis Siavelis -->
+```{r setup, include=FALSE}
+# Document configurations, DO NOT EDIT
+knitr::opts_chunk$set(echo = TRUE,
+                      eval = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+
+knitr::opts_knit$set(root.dir = '/Users/ioannis/Downloads/Giorgos_project/Georgios_Panos_project/code/')
+
+options(max.print=200)
+```
+
+# Libraries
+Load the libraries we are going to use 
+```{r load libraries}
+
+library(igraph)
+library(ggplot2)
+library(caret)
+library(ROCR)
+library(rgexf)
+library(umap)
+# library(Hmisc)
+# library(patchwork)
+
+```
+
+
+
+```{r calculate FDR function}
+# My threshold metric 
+calc_metric_FDR <- function(conf_matrix){
+  conf_ma <- conf_matrix
+
+  TP <- conf_ma$table[1,1]
+  TN <- conf_ma$table[2,2]
+  FP <- conf_ma$table[1,2]
+  FN <- conf_ma$table[2,1]
+  FDR <- (FP/(TP + FP))
+  return(FDR)
+}
+```
+
+
+```{r Threshold function}
+# My threshold value 
+thres_optim <- function(res_pred_dt, testFold, metric_thres){
+  min = 0
+  max = 1.0
+  while (max - min > 0.001){
+   
+     # first threshold
+    threshold = (min + max)/2
+    
+    # Convert probabilities to class predictions based on threshold
+    actual_pred <- res_pred_dt$Pred > threshold
+    
+    # Get prediction and groun truth df ready
+    res_pred_dt_new <- data.frame('Pred' = factor(actual_pred,c('TRUE', 'FALSE')),
+                                  'Init' = factor(testFold$db, c('TRUE', 'FALSE')))
+    
+    # Create confusion matrix
+    conf_ma <- confusionMatrix(res_pred_dt_new[["Pred"]], res_pred_dt_new[["Init"]], positive = "TRUE")
+    
+    # Calculate metric
+    current_metric <- calc_metric_FDR(conf_ma)
+    
+    if(is.nan(current_metric)) {
+      
+      return('cannot reach specified FDR')
+    
+      }
+    
+    # print(threshold)
+    
+    # Update bounds based on FDR
+    if (current_metric > metric_thres) {
+      min <- threshold
+    } else {
+      max <- threshold
+    }
+    
+    
+  }
+ 
+  return(threshold)
+  
+}
+
+```
+
+
+
+```{r Monte-Carlo cross validation}
+cv.fold <- function(cor_mat, max_iterations = 100, metric_thres = 0.01) {
+# Create equally sized lists
+  #why do this 100 times. 
+  
+  res_list_iter <- lapply(1:max_iterations, function(k) {
+    
+
+    # print(k)
+    set.seed(k)
+    idx_true <- sample(which(cor_mat$db), 2000)
+    idx_false <- sample(which(!cor_mat$db), 2000)
+    
+    cor_mat_train <- cor_mat[c(idx_true, idx_false), ]
+    
+    # split to train and validation set
+    set.seed(k)
+    folds <- createDataPartition(cor_mat_train$db, times = 1, p = 0.7)
+    
+    trainFold <- cor_mat_train[folds[[1]], ]
+    testFold <- cor_mat_train[setdiff(1:nrow(cor_mat_train), folds[[1]]), ]
+    
+    # Check parameters
+    set.seed(k)
+    formula_text <- paste0('db ~ ', paste(setdiff(colnames(cor_mat_train), c( "Var1", "Var2", "db")), collapse = ' + '))
+    
+    lr_model <- glm(eval(formula_text), family=binomial(link='logit'),data=trainFold) # logistic regression
+    
+    # Prediction of the 600 validation test data relationship between cor and probability of complex
+    res_pred <- predict(lr_model, newdata =  testFold,  type="response")
+    
+    res_pred_dt <- data.frame('Pred' = res_pred,
+                              'Init' = testFold$db)
+    
+    p_thres <- thres_optim(res_pred_dt = res_pred_dt, testFold = testFold, metric_thres = metric_thres)
+    
+    # Performance metrics - 1st classifier
+    pred <- prediction(res_pred_dt$Pred, res_pred_dt$Init)
+    perf <- performance(pred, "tpr", "fpr")
+    #auc_val <- unlist(slot(performance(pred, "auc"), "y.values"))
+    auc <- performance(pred,"auc")@y.values[[1]]
+    
+    
+    roc_data <- data.frame('FPR' = unlist(perf@x.values),
+                           'TPR' = unlist(perf@y.values),
+                           'Prob' = unlist(perf@alpha.values))
+
+    # pdf(paste0('../figures/ROC_curve_iter_', k, '.pdf'), width = 6, height = 5)
+    # plot(perf, colorize=FALSE, main = 'ROC curve, 1000/1000')
+    # dev.off()
+    
+    list('auc' = auc,
+         'thres_p' = p_thres, 
+         'model' = lr_model) 
+    
+  })
+  
+  toremove <- unlist(lapply(res_list_iter, function(j) j$thres_p)) == "cannot reach specified FDR"
+  res_list_iter <- res_list_iter[!toremove]
+
+  
+  all_auc <- data.frame('iter' = 1:length(res_list_iter), 
+                        'auc' = unlist(lapply(res_list_iter, function(j) j$auc)))
+  
+  # Median cor. across iterations
+  median_auc <- round(median(all_auc$auc), 3)
+  
+  # # Plot
+  # p_auc <- ggplot(all_auc, aes(x = '', y = auc)) +
+  #   geom_boxplot() +
+  #   geom_jitter(width = 0.1) +
+  #   annotate(x = 1, y = median_auc, geom = 'text', label = paste0('m = ', median_auc), vjust = -3) +
+  #   scale_y_continuous(limits = c(0, 1)) +
+  #   labs(x = '# Iterations', y = 'AUC') +
+  #   theme_classic()
+  # 
+  # pdf(paste0('../figures/pp_auc.pdf'), width = 4.5, height = 6)
+  # plot(p_auc)
+  # dev.off()
+  
+  # Extract thresholds 
+  all_thres <- data.frame('iter' = 1:length(res_list_iter), 
+                          'thres' = unlist(lapply(res_list_iter, function(j) j$thres_p)))
+  
+  all_thres$thres <- as.numeric(all_thres$thres)
+  median_thres <- round(median(all_thres$thres), 3)
+  
+  # p_thres <- ggplot(all_thres, aes(x = '', y = thres)) +
+  #   geom_boxplot() +
+  #   geom_jitter(width = 0.1) +
+  #   scale_y_continuous(limits = c(0, 1)) + 
+  #   annotate(x = 1, y = median_thres, geom = 'text', label = paste0('m = ', median_thres), vjust = -3) + 
+  #   labs(x = '# Iterations', y = 'Probability') +
+  #   theme_classic()
+  
+  # pdf(paste0('../figures/pp_thres_cor.pdf'), width = 4.5, height = 6)
+  # plot(p_thres)
+  # dev.off()
+  
+  
+  # Final threshold
+  final_thres <- median_thres
+  
+  final_thres_idx <-  which.min(abs(final_thres - all_thres$thres))
+  final_model <- res_list_iter[[final_thres_idx]]$model
+  
+  return(list('auc' = all_auc,
+              'thres' = all_thres,
+              'final_thres' = final_thres, 
+              'final_model' = final_model))
+}
+```
+
+```{r load data}
+merged_cor <- read.delim('../data/Processed/merged_cor.txt', sep = '\t')
+merged_cor_2 <- read.delim('../data/Processed/merged_cor_2.txt', sep = '\t')
+
+
+scbc_abms_res <- cv.fold(cor_mat = merged_cor, max_iterations = 100, metric_thres = 0.05)
+scbc_abms_rna_res <- cv.fold(cor_mat = merged_cor_2, max_iterations = 100, metric_thres = 0.05)
+
+# Compare
+scbc_abms_auc <- scbc_abms_res$auc
+scbc_abms_auc$group <- 'scbc_abms'
+
+scbc_abms_rna_auc <- scbc_abms_rna_res$auc
+scbc_abms_rna_auc$group <- 'scbc_abms_rna'
+
+
+all_auc <- rbind(scbc_abms_auc, scbc_abms_rna_auc)
+
+p_auc <- ggplot(all_auc ,aes(x = group, y = auc)) + 
+  geom_boxplot(outlier.colour = NA) + 
+  geom_jitter(width = 0.2) + 
+  annotate(x = c(1,2), y = 1, geom = 'text', label = paste0('m = ', c(round(median(all_auc$auc[all_auc$group == 'scbc_abms']), 3),
+                                                                      round(median(all_auc$auc[all_auc$group == 'scbc_abms_rna']), 3)))) + 
+  labs(x = '', y = 'AUC') + 
+  theme_classic() + 
+  scale_x_discrete(labels = c('SCBS & ABMS', 'SCBC & ABMS & scRNA')) + 
+  scale_y_continuous(limits = c(0,1), expand = c(0, 0, 0.1, 0.1))
+
+    
+ ggsave(paste0('../figures/auc_iter_method_comp.pdf'),plot = p_auc, width = 4.5, height = 6)
+
+```
+
+
+```{r Apply to all data}
+all_dat <- read.delim('../data/Processed/merged_cor_all.txt', sep = '\t')
+
+
+# Compare two models on total data
+models <- list('scbc_abms' = scbc_abms_res, 
+               'scbc_abms_scrna'= scbc_abms_rna_res)
+
+
+
+idx_true <- which(all_dat$db)
+set.seed(123)
+idx_false <- sample(which(!all_dat$db), length(idx_true))
+
+all_dat_train <- all_dat[c(idx_true, idx_false), ]
+    
+# split to train and validation set
+set.seed(123)
+folds <- createDataPartition(all_dat_train$db, times = 1, p = 0.7)
+
+trainFold <- all_dat_train[folds[[1]], ]
+testFold <- all_dat_train[setdiff(1:nrow(all_dat_train), folds[[1]]), ]
+
+# Check parameters
+lapply(c('scbc_abms', 'scbc_abms_scrna'), function(k) {
+  
+  set.seed(123)
+  if(k == 'scbc_abms') {
+    all_dat_train$scRNA <- NULL
+    }
+  
+  formula_text <- paste0('db ~ ', paste(setdiff(colnames(all_dat_train), c( "protein1", "protein2", "db")), collapse = ' + '))
+
+  # Prediction of the 600 validation test data relationship between cor and probability of complex
+  lr_model <- models[[k]]$final_model
+  res_pred <- predict(lr_model, newdata =  testFold,  type="response")
+
+  res_pred_dt <- data.frame('Pred' = res_pred,
+                          'Init' = testFold$db)
+  
+  p_thres <- models[[k]]$final_thres
+
+  # Performance metrics - 1st classifier
+  pred <- prediction(res_pred_dt$Pred, res_pred_dt$Init)
+  perf <- performance(pred, "tpr", "fpr")
+  #auc_val <- unlist(slot(performance(pred, "auc"), "y.values"))
+  auc <- performance(pred,"auc")@y.values[[1]]
+
+
+  roc_data <- data.frame('FPR' = unlist(perf@x.values),
+                         'TPR' = unlist(perf@y.values),
+                         'Prob' = unlist(perf@alpha.values))
+
+  idx_tohighlight <- which.min(abs(roc_data$Prob - p_thres))
+
+  p_auc_thres <- ggplot(roc_data, aes(x = FPR, y = TPR)) + 
+    geom_line() + 
+    geom_abline(slope = 1, lty = 2) + 
+    geom_vline(xintercept = roc_data$FPR[idx_tohighlight], col = 'red') + 
+    geom_hline(yintercept = roc_data$TPR[idx_tohighlight], col = 'red') +
+    labs(title = paste0(paste(setdiff(colnames(all_dat_train), c( "protein1", "protein2", "db")), collapse = ' & '),', n = ', length(idx_true)),
+         subtitle =  paste0('AUC = ', round(auc, 3))) + 
+    annotate(geom = 'text' ,x = roc_data$FPR[idx_tohighlight], y = Inf, label = round(roc_data$FPR[idx_tohighlight], 3), vjust = 1, hjust = -0.1, col = 'red') + 
+    annotate(geom = 'text' ,y = roc_data$TPR[idx_tohighlight], x = Inf, label = round(roc_data$TPR[idx_tohighlight], 3), vjust = -1, hjust = 1, col = 'red') + 
+    # scale_x_continuous(expand = c(0,0,0.1, 0.1)) + 
+    # scale_y_continuous(expand = c(0,0,0.1, 0.1)) + 
+    theme_classic() + 
+    theme(plot.title = element_text(hjust = 0.5), 
+          plot.subtitle = element_text(hjust = 0.5))
+
+ ggsave(paste0('../figures/auc_thres_plot_', k, '.pdf'),plot = p_auc_thres, width = 6.5, height = 5)
+
+  
+})
+
+
+# pdf(paste0('../figures/ROC_curve_iter_', k, '.pdf'), width = 6, height = 5)
+# plot(perf, colorize=FALSE, main = 'ROC curve, 1000/1000')
+# dev.off()
+
+
+
+# Final model
+final_model <- models[[2]]$final_model
+final_thres <-  models[[2]]$final_thres
+
+
+final_pred <- predict(final_model, newdata =  all_dat,  type="response")
+all_dat$pred <- final_pred
+all_dat$pred_thes <- all_dat$pred > final_thres
+
+write.table(all_dat[all_dat$pred_thes, ], '../data/Processed/all_dat_pred.txt', sep = '\t')
+
+
+```
