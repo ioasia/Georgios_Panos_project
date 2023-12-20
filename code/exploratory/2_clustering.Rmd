@@ -1,0 +1,319 @@
+---
+title: "Clustering"
+author: "Ioannis Siavelis, Georgios Panos"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapse: false
+    theme: "readable"
+---
+
+<!-- Lab creator: Ioannis Siavelis -->
+```{r setup, include=FALSE}
+# Document configurations, DO NOT EDIT
+knitr::opts_chunk$set(echo = TRUE,
+                      eval = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+
+knitr::opts_knit$set(root.dir = '/Users/ioannis/Downloads/Giorgos_project/Georgios_Panos_project/code/')
+
+options(max.print=200)
+
+```
+
+
+# Libraries
+Load the libraries we are going to use 
+```{r load libraries}
+library(igraph)
+library(ggplot2)
+library(ggrepel)
+library(umap)
+library(rgexf)
+```
+
+
+
+```{r load data}
+# Data
+all_dat <- read.delim('../data/Processed/all_dat_pred.txt', sep = '\t')
+
+# Create affinity matrix
+all_dat_thres_graph <- graph_from_data_frame(all_dat[, c('protein1', 'protein2')], directed = FALSE) 
+all_dat_thres_mat <- as_adjacency_matrix(all_dat_thres_graph)
+all_dat_thres_mat <- as.matrix(all_dat_thres_mat)
+
+## Shared neighbor graph
+all_dat_thres_sim <- as.data.frame(similarity(all_dat_thres_graph, method = "jaccard"))
+dimnames(all_dat_thres_sim) <- list(names(V(all_dat_thres_graph)), names(V(all_dat_thres_graph)))
+all_dat_thres_sim <- all_dat_thres_sim[rownames(all_dat_thres_mat), colnames(all_dat_thres_mat)]
+
+
+all_dat_thres_comb_mat <- all_dat_thres_sim * all_dat_thres_mat
+all_dat_thres_comb <- all_dat_thres_comb_mat
+all_dat_thres_comb$protein <- rownames(all_dat_thres_comb)
+all_dat_thres_comb <- reshape2::melt(all_dat_thres_comb)
+all_dat_thres_comb <- all_dat_thres_comb[all_dat_thres_comb$value > 0, ]
+
+all_dat_thres_comb_graph <- graph_from_data_frame(all_dat_thres_comb, directed = FALSE) 
+
+```
+
+
+``` {r Clustering}
+# Recursive clustering
+louvain.cluster <- function(input_graph, min_n  = 5, mod_thres = 0) {
+  
+      # input_graph <- all_dat_thres_comb_graph
+  
+  if(length(V(input_graph)) <= min_n) {
+    
+    return(input_graph)
+    
+    } else {
+  
+      set.seed(123)
+      net <- cluster_louvain(input_graph)
+      
+      if(net$modularity[1] > mod_thres) {
+        
+        net_sizes <- table(net$membership)
+        
+        sub_graphs <- lapply(names(net_sizes), function(i) subgraph(input_graph, net[[i]]))
+        
+        if(any(net_sizes > min_n)) {
+          
+          idx_still_large <- which(net_sizes > min_n)
+          sub_graphs_still_large <-  sub_graphs[idx_still_large]
+      
+          res <- lapply(sub_graphs_still_large, louvain.cluster)
+          return(res)
+          }
+        return(sub_graphs)
+        }
+      return(input_graph)
+      }
+}
+
+# Accumulate list of graphs
+graph_list_res <- louvain.cluster(input_graph = all_dat_thres_comb_graph)
+graph_init <- graph_list_res
+graph_list_new <- list()
+
+while(!all(sapply(graph_init, is.igraph))) {
+  
+  idx <- sapply(graph_init, is.igraph)
+  graph_list_new <- c(graph_list_new, graph_init[idx])
+  graph_init <- unlist(graph_init[!idx], recursive = FALSE)
+  
+}
+
+
+cluster_size <- unlist(lapply(graph_list_new, function(i) length(V(i))))
+cluster_size_dt <- as.data.frame(table(cluster_size))
+
+p_cluster_size <- ggplot(cluster_size_dt, aes(x = cluster_size, y = Freq)) + 
+  geom_bar(stat = 'identity') + 
+  geom_text(aes(label = Freq,vjust = -1)) + 
+  scale_y_continuous(expand = c(0, 0, 0.1, 0.1)) +
+  labs(x = 'Cluster size', y = 'Number of clusters', title = paste0('Louvain clustering (nodes = ', length(V(all_dat_thres_comb_graph)), ', edges = ', length(E(all_dat_thres_comb_graph)), ')')) + 
+  theme_classic() + 
+  theme(plot.title = element_text(hjust = 0.5))
+ 
+ggsave(paste0('../figures/louvain_cluster_size.pdf'),plot = p_cluster_size, width = 6, height = 5)
+
+```
+
+```{r Annotate clusters}
+
+# CORUM database
+corf <- read.delim('../data/Raw/humanComplexes.txt', sep = '\t')
+
+# Create a list of vectors. Each vector contains the proteins of the complex (gene names)
+cor_list <- lapply(1:nrow(corf), function(ind) {
+  
+  # For each row of the dataframe go to the complex members column and store value -> res
+  res = corf[ind, 'subunits.Gene.name.']
+  
+  
+  # Break the complex of members, which are separated by ; 
+  res = unique(unlist(strsplit(res, split = "[;// ]+")))
+  
+  # Filter away "None" and empty "" entries
+  res[!res %in% c("None", "")]
+  
+})
+names(cor_list) <- corf$ComplexName
+
+# Keep complexes with at least 3 members
+corum_sets <- cor_list[sapply(cor_list, function(x) length(x) > 2)]
+
+# Keep clusters with at least 3 members
+graph_list_more3 <- graph_list_new[which(cluster_size > 2)]
+
+
+# All cluster genes
+universe_net <- unlist(lapply(graph_list_new, function(i) names(V(i))))
+
+# Keep complexes with at least 3 members included in the network
+tokeep <- unlist(lapply(corum_sets, function(i) length(intersect(i,universe_net)) > 2))
+corum_sets <- corum_sets[tokeep]
+# corum_sets <- reshape2::melt(corum_sets)
+# corum_sets <- corum_sets[, rev(colnames(corum_sets))]
+
+# all_set <- unique(unlist(corum_sets))
+
+
+# Set enrichement threshold
+adj_pval_thres <- 0.01
+
+
+annotate_cluster <- do.call(rbind, lapply(1:length(graph_list_more3), function(i) {
+  
+  # print(i)
+  
+  g <- graph_list_more3[[i]]
+  cluster_genes <- names(V(g))
+
+  
+  res_fisher_dt <- do.call(rbind, lapply(1:length(corum_sets), function(j) {
+   
+    # print(j)
+    
+    complex_genes <- corum_sets[[j]]
+    
+    n1 <- length(intersect(cluster_genes, complex_genes))
+    n2 <- length(intersect(complex_genes, setdiff(universe_net, cluster_genes)))
+    n3 <- length(intersect(cluster_genes, setdiff(all_set, complex_genes)))
+    n4 <- length(intersect(setdiff(universe_net, cluster_genes), setdiff(all_set, complex_genes)))
+    
+    fisher_tab <- matrix(c(n1, n2, n3, n4), nrow = 2, ncol = 2, byrow = TRUE)
+    
+    res_p <- fisher.test(fisher_tab, alternative = 'greater')
+    # fc <- (n1/(n1 + n3))/((n1 + n3)/(n1 + n2 + n3 + n4))
+    
+    data.frame('cluster' = i,
+               'complex_name' = names(corum_sets)[j],
+               'pvalue' = res_p$p.value,
+               'n_over' = n1, 
+               'n_inc' = length(intersect(complex_genes, universe_net)),
+               'n_clust' = length(cluster_genes),
+               'perc_comp' = n1/length(intersect(complex_genes, universe_net)),
+               'perc_clust' = n1/ length(cluster_genes))
+    
+    }))
+  
+  res_fisher_dt$adj_pvalue <- p.adjust(res_fisher_dt$pvalue, method = 'BH')
+  res_fisher_dt <- res_fisher_dt[res_fisher_dt$adj_pvalue < adj_pval_thres, ]
+  
+  }))
+
+# Filter by percentage of cluster occupancy
+annotate_cluster <- annotate_cluster[annotate_cluster$perc_clust >= 0.3, ]
+annotate_cluster <- annotate_cluster[order(annotate_cluster$adj_pvalue), ]
+ 
+
+# Plot percentages
+enriched_perc_dt <- rbind.data.frame( length(unique(annotate_cluster$cluster)), length(graph_list_more3) -  length(unique(annotate_cluster$cluster)))
+colnames(enriched_perc_dt) <- 'n'
+enriched_perc_dt$group <- c('Enriched', 'Rest')
+
+# Compute the position of labels
+enriched_perc_dt <- enriched_perc_dt %>% 
+  arrange(desc(group)) %>%
+  mutate(prop = n / sum(enriched_perc_dt$n) *100) %>%
+  mutate(ypos = cumsum(prop)- 0.5*prop )
+
+enriched_perc_dt$label <- paste0(enriched_perc_dt$group, '\n(', enriched_perc_dt$n,', ' , round(enriched_perc_dt$prop, 2), '%)')
+
+p_perc <- ggplot(enriched_perc_dt, aes(x="", y=prop, fill=group)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +
+  labs(title = 'Clusters enriched in CORUM') +
+  theme_void() + 
+  theme(legend.position="none", plot.title = element_text(hjust = 0.5)) +
+  geom_text(aes(y = ypos, label = label), color = "white", size=6) +
+  scale_fill_brewer(palette="Set1")
+
+ggsave(paste0('../figures/louvain_cluster_corum_enriched_pie.pdf'),plot = p_perc, width = 6, height = 5)
+
+# Keep most representative for each cluster
+annotate_cluster_plot <- annotate_cluster[!duplicated(annotate_cluster$cluster), ]
+tohighlight <- head(annotate_cluster_plot, 5)
+annotate_cluster_plot$cluster <- factor(annotate_cluster_plot$cluster, levels = annotate_cluster_plot$cluster)
+
+p_annot_enrich <- ggplot(annotate_cluster_plot, aes(x = cluster, y = -log10(pvalue), size = n_clust)) + 
+  geom_point() + 
+  geom_hline(yintercept = -log10(adj_pval_thres), lty = 2) + 
+  annotate(geom = 'text', x = Inf, y =  -log10(adj_pval_thres), 
+           label = paste0('adj.pvalue = ', adj_pval_thres), vjust = -0.5, hjust = 1) + 
+  geom_point(data = tohighlight, col = 'red', show.legend = FALSE) + 
+  geom_label_repel(data = tohighlight, mapping = aes(label = complex_name), col = 'red', min.segment.length = 0.1, show.legend = FALSE) + 
+  labs(x = 'Cluster', y = '-log10(adj_pvalue)', title = paste0('CORUM enrichment test, n = ', length(unique(annotate_cluster$cluster)))) + 
+  theme_classic() + 
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) + 
+  scale_x_discrete(expand = c(0.05, 0.05, 0.05, 0.05)) +
+  guides(size = guide_legend(title = 'Cluster size'))
+
+ggsave(paste0('../figures/louvain_cluster_corum_enriched_scatter.pdf'),plot = p_annot_enrich, width = 8, height = 6)
+
+```
+
+
+
+``` {r Vizualize network}
+# UMAP
+# display default settings
+umap.defaults
+
+set.seed(123)
+graph_umap <- umap(all_dat_thres_comb_mat)
+plot_umap <- as.data.frame(graph_umap$layout)
+
+
+# Extract cluster gene symbols
+cluster_index_enriched <- unique(annotate_cluster$cluster)
+gene_symbols_enriched <- unlist(lapply(graph_list_more3[cluster_index_enriched], function(i) names(V(i))))
+
+plot_umap$gene <- rownames(plot_umap)
+plot_umap$enriched <- plot_umap$gene %in% gene_symbols_enriched
+
+plot_umap <- plot_umap[order(plot_umap$enriched), ]
+
+
+p_umap <- ggplot(plot_umap, aes(x = V1, y = V2, col = enriched)) + 
+  geom_point() + 
+  scale_color_manual(name = 'Enriched', 
+                     values = c('TRUE' = 'red', 'FALSE' = 'grey'), labels = c('Yes', 'No'), 
+                     breaks = c('TRUE','FALSE')) + 
+  theme_classic() + 
+  labs(x = 'UMAP-1', y = 'UMAP-2', title = paste0('PPI network')) +
+  theme(axis.text = element_blank(), 
+        axis.ticks = element_blank(), 
+        plot.title = element_text(hjust = 0.5))
+
+ggsave(paste0('../figures/louvain_cluster_umap.pdf'),plot = p_umap, width = 7, height = 5.5)
+
+
+## Igraph plot 
+# Extract subgraph
+toplot <- annotate_cluster[15, ]
+igraphtoplot <- graph_list_more3[[as.numeric(as.character(toplot$cluster))]]
+
+coords <- layout_in_circle(igraphtoplot)
+V(igraphtoplot)$label.color <- 'black'
+plot(igraphtoplot, layout = coords)
+
+
+# Output for GEPHI (a network vizualization program, https://gephi.org)
+togephi <- igraph.to.gexf(all_dat_thres_graph)
+write.gexf(togephi, output=paste0('../figures/pp_network.gexf'), replace=TRUE,  defaultedgetype = "undirected")
+
+
+```
